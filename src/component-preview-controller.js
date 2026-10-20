@@ -21,7 +21,7 @@
       if(same.length===1)return same[0];
       return S.draft.length===1?S.draft[0]:null;
     }
-    async open(){
+    async open(preferredId){
       this.active=true;this.S.history=false;
       $('draftContent').classList.add('hidden');$('historyContent').classList.add('hidden');$('commitPanel').classList.add('hidden');$('componentPreviewPanel').classList.remove('hidden');
       $('draftTab').classList.remove('active');$('historyTab').classList.remove('active');$('componentPreviewTab').classList.add('active');$('selectionHeading').textContent='محاكي المكوّن';
@@ -29,7 +29,7 @@
       if(this.a.isMobile()&&!$('selectionSidebar').classList.contains('mobile-open'))this.a.toggleMobilePanel('selectionSidebar','toggleSelections');
       if(!this.renderer)this.renderer=new root.C4ComponentPreviewRenderer($('componentPreviewViewport'),{onPick:wire=>this.pickWire(wire),onViewChange:view=>{$('componentPreviewView').value=view;}});
       this.selectionChanged();
-      await this.load();requestAnimationFrame(()=>this.renderer?.resize());
+      await this.load(preferredId);requestAnimationFrame(()=>this.renderer?.resize());
     }
     close(){this.active=false;clearTimeout(this.timer);document.body.classList.remove('preview-expanded');$('expandComponentPreview').setAttribute('aria-pressed','false');$('componentPreviewPanel').classList.add('hidden');$('componentPreviewTab').classList.remove('active');this.cancelCapture();this.clearPick();}
     clearPick(){if(this.S.previewPick){this.S.previewPick=null;this.a.redraw();}$('previewSelectedLine').textContent='';}

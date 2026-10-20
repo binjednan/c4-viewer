@@ -60,6 +60,13 @@ const setKey=s=>s?Array.from(s).join('\x1f'):'';
 const boundsCache=new WeakMap();
 const nativeBounds=commandBounds;
 commandBounds=function(c){let b=boundsCache.get(c);if(!b){b=nativeBounds(c);boundsCache.set(c,b);}return b;};
+const optionNumber=(value,fallback,min,max)=>Number.isFinite(value)?Math.max(min,Math.min(max,value)):fallback;
+const countBelow=(items,limit)=>{let lo=0,hi=items.length;while(lo<hi){const mid=(lo+hi)>>1;if(items[mid].extent<=limit)lo=mid+1;else hi=mid;}return lo;};
+function clippedSegment(a,b,box){
+  let lo=0,hi=1;
+  for(let k=0;k<2;k++){const d=b[k]-a[k];if(Math.abs(d)<1e-12){if(a[k]<box[k]||a[k]>box[k+2])return null;}else{let u=(box[k]-a[k])/d,v=(box[k+2]-a[k])/d;if(u>v)[u,v]=[v,u];lo=Math.max(lo,u);hi=Math.min(hi,v);if(lo>hi)return null;}}
+  return[[a[0]+(b[0]-a[0])*lo,a[1]+(b[1]-a[1])*lo],[a[0]+(b[0]-a[0])*hi,a[1]+(b[1]-a[1])*hi]];
+}
 
 class C4VectorEngine{
   constructor(svg){
@@ -71,7 +78,9 @@ class C4VectorEngine{
     this.defs=node('defs');this.scene=node('g',{'data-role':'vector-drawing'});
     this.ink=node('g',{'data-role':'native-ink'});this.textInk=node('g',{'data-role':'native-text'});
     this.overlay=node('g',{'data-role':'selection-ink'});
-    this.scene.append(this.ink,this.textInk,this.overlay);svg.replaceChildren(this.defs,this.scene);
+    // Screen-size selection hints are decoration only: they never enter native geometry or hit testing.
+    this.indicatorInk=node('g',{'data-role':'selection-indicators','pointer-events':'none','aria-hidden':'true'});
+    this.scene.append(this.ink,this.textInk,this.overlay);svg.replaceChildren(this.defs,this.scene,this.indicatorInk);
     this.cacheLimits={batches:384,text:128};
   }
   load({page,rows,text}){
@@ -79,6 +88,7 @@ class C4VectorEngine{
     this.grid=new Map();this.large=[];this.styles=new Map();this.batches=[];this.batchGrid=new Map();this.largeBatches=[];
     this.activeBatches=new Set();this.activeText=new Set();this.batchLRU=new Map();this.textLRU=new Map();
     this.overlays=[];this.focusNode=null;this.focusKey=null;this.queryEpoch=0;this.textGrid=new Map();this.largeText=[];this.spans=textSpans(text);
+    this.selectionCache=new Map();this.selectionEpoch=0;this.currentViewport=null;this.indicatorNodes=new Map();this.indicatorKey=null;this.indicatorCull=null;this.indicatorOrigin=null;this.indicatorTransform=null;this.indicatorMarkers=[];this.indicatorStats=null;this.indicatorInk.replaceChildren();
     this.defs.replaceChildren();this.ink.replaceChildren();this.textInk.replaceChildren();this.overlay.replaceChildren();
     this.rootInk={node:this.ink,attached:[],root:true};this.rootText={node:this.textInk,attached:[],root:true};
     const frames=typeof page.frames==='string'?JSON.parse(page.frames):page.frames||{};
@@ -149,7 +159,7 @@ class C4VectorEngine{
     for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(const r of grid.get(x+','+y)||[])take(r);
     return result;
   }
-  invalidate(){this.invalid=true;for(const set of this.overlays)set.key=null;}
+  invalidate(){this.invalid=true;this.selectionEpoch++;this.indicatorKey=null;for(const set of this.overlays)set.key=null;}
   getLayers(){return[...this.layerMap.values()].sort((a,b)=>a.name.localeCompare(b.name));}
   getRecord(rowOrId){return this.records.get(typeof rowOrId==='string'?rowOrId:rowOrId?.record_id);}
   isRowVisible(rowOrId,selectable=false){
@@ -195,6 +205,131 @@ class C4VectorEngine{
       }
     }
     return result;
+  }
+  _selectionSnapshot(ids,revision,cached){
+    const sourceKey=revision!=null?'revision:'+revision:setKey(ids);
+    let s=cached;
+    if(!s||s.sourceKey!==sourceKey){
+      const seen=new Set(),members=[];let sourceBBox=null;
+      for(const id of ids||[]){if(seen.has(id))continue;seen.add(id);if(typeof id!=='string')continue;const item=this.getItem(id);if(item){members.push(item);sourceBBox=union(sourceBBox,item.bbox);}}
+      s={sourceKey,members,total:seen.size,sourceBBox,missingCount:seen.size-members.length,visibilityKey:null};
+    }
+    const o=this.options,key=this.selectionEpoch+'|'+(this._visibilityKey??[setKey(o.hiddenItems),setKey(o.hiddenLayers),setKey(o.lockedLayers),(o.isolatedItems?'isolated:':'all:')+setKey(o.isolatedItems)].join('|'))+'|'+(o.drawingOnly!==false);
+    if(s.visibilityKey!==key){
+      const visible=[];let bbox=null,lockedCount=0;
+      for(const item of s.members){
+        if(!this.isItemVisible(item.id,true)){if(o.lockedLayers?.has(item.row.drawing.layer||'')&&this.isItemVisible(item.id))lockedCount++;continue;}
+        let b=intersect(item.bbox,item.record.clipped);if(o.drawingOnly!==false)b=intersect(b,this.cropInfo.bounds);if(!valid(b))continue;
+        const viewBBox=transformBox(b,this.matrix),entry={id:item.id,item,bbox:b,viewBBox,extent:Math.max(viewBBox[2]-viewBBox[0],viewBBox[3]-viewBBox[1]),order:visible.length};
+        visible.push(entry);bbox=union(bbox,b);
+      }
+      s.visible=visible;s.bySize=visible.slice().sort((a,b)=>a.extent-b.extent||a.order-b.order);s.bbox=bbox;s.lockedCount=lockedCount;s.hiddenCount=s.members.length-visible.length;s.visibilityKey=key;s.spatial=null;s.measurement=null;
+    }
+    return s;
+  }
+  _selectionQuery(s,b){
+    if(!valid(b)||!s.bbox||!overlap(s.bbox,b))return[];
+    if(contained(s.bbox,b))return s.visible;
+    if(!s.spatial){const index={grid:new Map(),large:[]};for(const item of s.visible)this._index(index.grid,index.large,item,item.bbox,64,120);s.spatial=index;}
+    return this._query(s.spatial.grid,s.spatial.large,s.visible,b);
+  }
+  _selectionMeasurement(s,options={}){
+    const zoom=optionNumber(options.zoom,this.options.zoom||1,1e-9,1e9),threshold=optionNumber(options.tinyThresholdCSS,6,0,32),limit=threshold/zoom;
+    const viewport=options.viewportBBox===undefined?this.currentViewport:options.viewportBBox,key=zoom+'|'+threshold+'|'+(valid(viewport)?viewport.map(nfmt).join(','):'all');
+    if(!s.measurement||s.measurement.key!==key){
+      const tiny=countBelow(s.bySize,limit);let inViewport=s.visible.length,tinyInViewport=tiny;
+      if(valid(viewport)&&s.bbox&&!contained(s.bbox,viewport)){
+        inViewport=0;tinyInViewport=0;
+        for(const item of this._selectionQuery(s,viewport))if(contained(item.bbox,viewport)||commandCrossesBox(item.item.command,intersect(item.bbox,viewport))){inViewport++;if(item.extent<=limit)tinyInViewport++;}
+      }
+      s.measurement={key,value:{total:s.total,visible:s.visible.length,hiddenCount:s.hiddenCount,lockedCount:s.lockedCount,missingCount:s.missingCount,tiny,inViewport,tinyInViewport,bbox:s.bbox?.slice()||null,sourceBBox:s.sourceBBox?.slice()||null,zoom,tinyThresholdCSS:threshold}};
+    }
+    const result={...s.measurement.value,bbox:s.bbox?.slice()||null,sourceBBox:s.sourceBBox?.slice()||null};
+    if(options.includeTinyIds){const cap=Math.floor(optionNumber(options.tinyIdsLimit,200,0,200));result.tinyIds=s.bySize.slice(0,Math.min(cap,result.tiny)).map(item=>item.id);result.tinyIdsTruncated=result.tiny>result.tinyIds.length;}
+    if(options.includeVisibleIds){const cap=Math.floor(optionNumber(options.visibleIdsLimit,200,0,200));result.visibleIds=s.visible.slice(0,cap).map(item=>item.id);result.visibleIdsTruncated=s.visible.length>result.visibleIds.length;}
+    return result;
+  }
+  // Pass a changing revision for mutable IDs; cacheKey allows a caller to recreate its Set cheaply.
+  // Counts are complete. Optional ID lists are capped at 200; bbox describes visible source geometry.
+  measureSelection(ids,options={}){
+    if(!this.info)return{total:0,visible:0,hiddenCount:0,lockedCount:0,missingCount:0,tiny:0,inViewport:0,tinyInViewport:0,bbox:null,sourceBBox:null,...(options.includeTinyIds?{tinyIds:[],tinyIdsTruncated:false}:{})};
+    const key=options.cacheKey??ids??'empty',snapshot=this._selectionSnapshot(ids,options.revision,this.selectionCache.get(key));
+    this.selectionCache.delete(key);this.selectionCache.set(key,snapshot);while(this.selectionCache.size>8)this.selectionCache.delete(this.selectionCache.keys().next().value);
+    return this._selectionMeasurement(snapshot,options);
+  }
+  _syncIndicatorPaths(buckets){
+    for(const[key,old]of this.indicatorNodes)if(!buckets.has(key)){old.markers?.remove();old.frames?.remove();this.indicatorNodes.delete(key);}
+    for(const[key,bucket]of buckets){
+      let entry=this.indicatorNodes.get(key);if(!entry){entry={};this.indicatorNodes.set(key,entry);}
+      for(const kind of ['frames','markers']){
+        const d=bucket[kind].join('');if(!d){entry[kind]?.remove();entry[kind]=null;continue;}
+        if(!entry[kind]){entry[kind]=node('path',{'data-role':kind==='frames'?'selection-entity-frames':'selection-locators',fill:'none',stroke:bucket.color,'stroke-width':kind==='frames'?1:1.5,'stroke-opacity':bucket.opacity*(kind==='frames'?.65:1),'stroke-linejoin':'miter','stroke-linecap':'square',...(kind==='frames'?{'stroke-dasharray':'4 3'}:{})});this.indicatorInk.append(entry[kind]);}
+        if(entry[kind].getAttribute('d')!==d)entry[kind].setAttribute('d',d);
+      }
+    }
+  }
+  _drawSelectionIndicators(o,visibilityKey,viewport){
+    const descriptors=[],sets=o.highlightSets||[],maxMarkers=Math.floor(optionNumber(o.selectionMarkerLimit,180,0,256));
+    for(let index=0;index<sets.length;index++){
+      const set=sets[index];if(set.role!=='selection'||(!set.tinyMarkers&&!set.entity))continue;
+      const entry=this.overlays[index],entity=set.entity&&typeof set.entity==='object'?set.entity:null;
+      const revision=set.revision!=null?set.revision+'|entity:'+(entity?.id??''):null;
+      entry.selectionSnapshot=this._selectionSnapshot(set.ids,revision,entry.selectionSnapshot);
+      descriptors.push({set,entity,snapshot:entry.selectionSnapshot,size:optionNumber(set.markerSizeCSS,8,5,14),threshold:optionNumber(set.tinyThresholdCSS,6,0,32),limit:Math.floor(optionNumber(set.markerLimit,maxMarkers,0,256))});
+    }
+    if(!descriptors.length){
+      if(this.indicatorNodes.size)this._syncIndicatorPaths(new Map());this.indicatorKey=null;this.indicatorCull=null;this.indicatorMarkers=[];
+      this.indicatorStats={markers:0,visibleMarkers:0,tinyMarkers:0,visibleTinyMarkers:0,entityFrames:0,tinySelected:0,tinyCandidates:0,clusteredTiny:0,limitedTiny:0,limitedEntities:0,markerLimit:maxMarkers,svgNodes:0};
+      return this.indicatorStats;
+    }
+    const zoom=o.zoom,key=JSON.stringify([visibilityKey,this.selectionEpoch,zoom,o.width,o.height,maxMarkers,descriptors.map(d=>[d.snapshot.sourceKey,d.entity?.id??null,d.entity?.bbox??null,d.set.color,d.set.opacity,d.size,d.threshold,d.limit,!!d.set.tinyMarkers])]);
+    if(this.indicatorKey!==key||!this.indicatorCull||!contained(viewport,this.indicatorCull)){
+      const margin=96/zoom,cull=[viewport[0]-margin,viewport[1]-margin,viewport[2]+margin,viewport[3]+margin];
+      const origin=apply(this.matrix,[(viewport[0]+viewport[2])/2,(viewport[1]+viewport[3])/2]),offset=[o.tx+zoom*origin[0],o.ty+zoom*origin[1]],clip=[-offset[0]-96,-offset[1]-96,o.width-offset[0]+96,o.height-offset[1]+96];
+      const buckets=new Map(),occupied=new Map(),entities=new Set(),markers=[],stats={markers:0,visibleMarkers:0,tinyMarkers:0,visibleTinyMarkers:0,entityFrames:0,tinySelected:0,tinyCandidates:0,clusteredTiny:0,limitedTiny:0,limitedEntities:0,markerLimit:maxMarkers,svgNodes:0};
+      const bucketFor=d=>{const color=d.set.color||'#2563eb',opacity=optionNumber(d.set.opacity,1,0,1),k=color+'|'+opacity;if(!buckets.has(k)){if(buckets.size>=8)return buckets.values().next().value;buckets.set(k,{color,opacity,frames:[],markers:[]});}return buckets.get(k);};
+      const local=p=>[(p[0]-origin[0])*zoom,(p[1]-origin[1])*zoom];
+      const square=(p,size)=>{const h=size/2;return'M'+point([p[0]-h,p[1]-h])+'h'+nfmt(size)+'v'+nfmt(size)+'h'+nfmt(-size)+'Z';};
+      const addMarker=(d,p,kind)=>{const localPoint=local(p);bucketFor(d).markers.push(square(localPoint,d.size));markers.push({point:localPoint,half:d.size/2,kind});stats.markers++;if(kind==='tiny')stats.tinyMarkers++;};
+      // A group is one selected entity: one frame and one centre square, never resize grips.
+      for(const d of descriptors){
+        const s=d.snapshot;stats.tinySelected+=countBelow(s.bySize,d.threshold/zoom);if(!d.entity||!s.bbox||!overlap(s.bbox,cull))continue;
+        const identity=d.entity.id??s.sourceKey;if(entities.has(identity))continue;entities.add(identity);
+        if(stats.entityFrames+stats.tinyMarkers>=maxMarkers||!d.limit){stats.limitedEntities++;continue;}
+        const b=transformBox(s.bbox,this.matrix),a=local([b[0],b[1]]),z=local([b[2],b[3]]),frame=[a[0]-3,a[1]-3,z[0]+3,z[1]+3];
+        const corners=[[frame[0],frame[1]],[frame[2],frame[1]],[frame[2],frame[3]],[frame[0],frame[3]]],parts=[];
+        for(let k=0;k<4;k++){const segment=clippedSegment(corners[k],corners[(k+1)%4],clip);if(segment)parts.push('M'+point(segment[0])+'L'+point(segment[1]));}
+        const centre=[(b[0]+b[2])/2,(b[1]+b[3])/2],lp=local(centre),centreVisible=inside(lp,clip);
+        if(!parts.length&&!centreVisible)continue;
+        if(parts.length)bucketFor(d).frames.push(parts.join(''));stats.entityFrames++;
+        if(centreVisible)addMarker(d,centre,'entity');
+      }
+      // Locator candidates use the selection's own spatial index. They are batched and de-cluttered.
+      for(const d of descriptors){
+        if(d.entity||!d.set.tinyMarkers)continue;
+        const s=d.snapshot,threshold=d.threshold/zoom,candidates=this._selectionQuery(s,cull),view=[-offset[0],-offset[1],o.width-offset[0],o.height-offset[1]];let drawn=0;
+        // Spend the limited locator budget inside the viewport before keeping overscan locators.
+        for(let pass=0;pass<2;pass++)for(const entry of candidates){
+          if(entry.extent>threshold)continue;
+          const p=[(entry.viewBBox[0]+entry.viewBBox[2])/2,(entry.viewBBox[1]+entry.viewBBox[3])/2],lp=local(p);if(!inside(lp,clip))continue;
+          if(inside(lp,view,d.size/2)!==(pass===0))continue;
+          stats.tinyCandidates++;
+          const screen=[p[0]*zoom,p[1]*zoom],cx=Math.floor(screen[0]/18),cy=Math.floor(screen[1]/18);let crowded=false;
+          for(let x=cx-1;x<=cx+1&&!crowded;x++)for(let y=cy-1;y<=cy+1&&!crowded;y++)for(const old of occupied.get(x+','+y)||[])if(Math.max(Math.abs(screen[0]-old.x),Math.abs(screen[1]-old.y))<(d.size+old.size)/2+3){crowded=true;break;}
+          if(crowded){stats.clusteredTiny++;continue;}
+          if(stats.entityFrames+stats.tinyMarkers>=maxMarkers||drawn>=d.limit){stats.limitedTiny++;continue;}
+          const cell=cx+','+cy;let points=occupied.get(cell);if(!points)occupied.set(cell,points=[]);points.push({x:screen[0],y:screen[1],size:d.size});addMarker(d,p,'tiny');drawn++;
+        }
+      }
+      this._syncIndicatorPaths(buckets);stats.svgNodes=[...this.indicatorNodes.values()].reduce((n,e)=>n+!!e.markers+!!e.frames,0);
+      this.indicatorKey=key;this.indicatorCull=cull;this.indicatorOrigin=origin;this.indicatorMarkers=markers;this.indicatorStats=stats;
+    }
+    const origin=this.indicatorOrigin,offset=[o.tx+zoom*origin[0],o.ty+zoom*origin[1]],transform='translate('+point(offset)+')';
+    if(this.indicatorTransform!==transform){this.indicatorInk.setAttribute('transform',transform);this.indicatorTransform=transform;}
+    let visibleMarkers=0,visibleTinyMarkers=0;
+    for(const marker of this.indicatorMarkers)if(inside([marker.point[0]+offset[0],marker.point[1]+offset[1]],[0,0,o.width,o.height],marker.half)){visibleMarkers++;if(marker.kind==='tiny')visibleTinyMarkers++;}
+    this.indicatorStats.visibleMarkers=visibleMarkers;this.indicatorStats.visibleTinyMarkers=visibleTinyMarkers;
+    return this.indicatorStats;
   }
   _style(style,o,locked=false,partial=false){
     const key=[o.theme,o.colorMode,o.fineLine!==false,locked,partial].join('|');let result=style.variants.get(key);if(result)return result;
@@ -331,10 +466,12 @@ class C4VectorEngine{
     const key=[o.drawingOnly,o.fineLine,o.theme,o.colorMode,o.hideText,visibilityKey].join('|');
     this._updateVisibility(o,visibilityKey);
     const visible=transformBox([-o.tx/z,-o.ty/z,(o.width-o.tx)/z,(o.height-o.ty)/z],this.inverse);
+    this.currentViewport=visible;
     const recull=this.invalid||key!==this.lastKey||!this.lastView||!contained(visible,this.lastView)||z>this.lastZoom*2.2||z<this.lastZoom/1.8;
     if(recull){const margin=Math.min(240,Math.max(120,Math.max(o.width,o.height)*.16))/z,cull=[visible[0]-margin,visible[1]-margin,visible[2]+margin,visible[3]+margin];this._syncInk(cull,o);this.lastView=cull;this.lastZoom=z;this.lastKey=key;this.invalid=false;this.svg.style.backgroundColor=o.colorMode==='source'?'#ffffff':o.theme==='dark'?'#121923':'#f5f7fb';}
     if(recull||this.lastDashZoom!==z){for(const b of this.activeBatches){if(!b.style.dash.array.length||!b.nonScaling||b.dashZoom===z)continue;b.node.setAttribute('stroke-dasharray',b.style.dash.array.map(v=>nfmt(v*z)).join(' '));b.node.setAttribute('stroke-dashoffset',nfmt(b.style.dash.offset*z));b.dashZoom=z;}this.lastDashZoom=z;}
     this._drawOverlay(o,visibilityKey+'|'+o.drawingOnly);
+    this.stats.selectionIndicators=this._drawSelectionIndicators(o,visibilityKey+'|'+o.drawingOnly,visible);
     if(recull){this.svg.dataset.renderer='direct-svg';this.svg.dataset.visibleRecords=String(this.stats?.visibleRecords||0);}return this.stats;
   }
 }

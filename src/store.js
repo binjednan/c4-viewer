@@ -60,7 +60,7 @@
   }
 
   class C4Store {
-    constructor(database) { this.db = database; this._groups = null; this._classificationCache=null; this._classificationCatalog=null; this._approvedComponents=null; }
+    constructor(database) { this.db = database; this._groups = null; this._classificationCache=null; this._classificationCatalog=null; this._approvedComponents=null; this._selectionUnits=null; }
     _rows(sql, parameters = []) {
       const statement = this.db.prepare(sql), result = [];
       try { statement.bind(parameters); while (statement.step()) result.push(statement.getAsObject()); }
@@ -71,8 +71,8 @@
     _run(sql, parameters = []) { this.db.run(sql, parameters); }
     _atomic(operation) {
       this.db.run('BEGIN TRANSACTION');
-      try { const result = operation(); this.db.run('COMMIT'); this._groups = null; this._classificationCache=null; this._approvedComponents=null; return result; }
-      catch (error) { this.db.run('ROLLBACK'); this._groups = null; this._classificationCache=null; this._approvedComponents=null; throw error; }
+      try { const result = operation(); this.db.run('COMMIT'); this._groups = null; this._classificationCache=null; this._approvedComponents=null; this._selectionUnits=null; return result; }
+      catch (error) { this.db.run('ROLLBACK'); this._groups = null; this._classificationCache=null; this._approvedComponents=null; this._selectionUnits=null; throw error; }
     }
     _bump() {
       this.setMeta('revision', Number(this.getMeta('revision') || 0) + 1);
@@ -119,6 +119,98 @@
       const links = this._identityRelations(id), ids = unique(links.map(r => r.to_id));
       if (ids.length > 1) fail('MULTIPLE_IDENTITIES', 'هذه المجموعة مرتبطة بأكثر من هوية؛ يلزم تصحيح الربط قبل المتابعة.', {representation_id:id, element_ids:ids});
       return ids.length ? this.getNode(ids[0]) : null;
+    }
+    _selectionUnitState() {
+      if(this._selectionUnits)return this._selectionUnits;
+      // This is a disposable read index over the existing graph, not persisted groups or new identities.
+      const state={units:new Map(),byRepresentation:new Map(),byItem:new Map(),typeRepresentations:new Map(),typeItems:new Map(),representationPages:new Map(),nonInstanceIds:new Set(),revision:Number(this.getMeta('revision') || 0)};
+      const decisions=this.listConfirmed().filter(c=>c.created_by===AUTHOR && c.approved_by==='owner'),active=new Map(decisions.map(c=>[c.id,c]));
+      if(!decisions.length){this._selectionUnits=state;return state;}
+      const add=(map,key,value)=>{if(!map.has(key))map.set(key,new Set());map.get(key).add(value);};
+      const repIds=unique(decisions.flatMap(c=>[...(c.representation_ids || []),...(c.representations || []).map(r=>r.id)]).filter(Boolean));
+      const selectIds=(prefix,ids)=>{const result=[];for(let offset=0;offset<ids.length;offset+=350){const chunk=ids.slice(offset,offset+350);result.push(...this._rows(prefix+'('+chunk.map(()=>'?').join(',')+')',chunk));}return result;};
+      const nodes=new Map(selectIds('SELECT id,data FROM nodes WHERE id IN ',unique([...repIds,...decisions.map(c=>c.element_id)]).filter(id=>typeof id==='string' && id)).map(r=>[r.id,json(r.data)]));
+      for(const n of nodes.values()){if(n.page_id)state.representationPages.set(n.id,n.page_id);if(n.identity_level==='type' || ['type','family'].includes(n.kind))state.nonInstanceIds.add(n.id);}
+      const memberships=new Map(),links=new Map(),relationRows=selectIds("SELECT id,type,from_id,to_id,data FROM relations WHERE type='hierarchy_member' AND to_id IN ",repIds);
+      for(const row of relationRows){if(!ITEM.test(row.from_id))continue;if(!memberships.has(row.to_id))memberships.set(row.to_id,new Map());const map=memberships.get(row.to_id);if(!map.has(row.from_id))map.set(row.from_id,[]);map.get(row.from_id).push(row.id);}
+      const physical=c=>c?.identity_level==='instance' && ['same_element_identity','component_geometry'].includes(c.action);
+      const records=new Map();
+      const ensure=elementId=>{
+        if(!records.has(elementId)){const n=nodes.get(elementId);records.set(elementId,{element:n,representations:new Map(),relation_ids:new Set(),confirmation_ids:new Set(),sections:new Set(n?.section?[n.section]:[]),categories:new Set(n?.category?[n.category]:[]),sources:[],issues:[],conflicts:new Set()});}
+        return records.get(elementId);
+      };
+      for(const row of selectIds("SELECT id,type,from_id,to_id,data FROM relations WHERE type='alternative_representation' AND from_id IN ",repIds)){
+        const relation={...json(row.data),id:row.id,from_id:row.from_id,to_id:row.to_id},decision=active.get(relation.decision_id);
+        if(relation.created_by!==AUTHOR || relation.owner_confirmed!==true || !decision || decision.element_id!==relation.to_id || ![...(decision.representation_ids || []),...(decision.representations || []).map(r=>r.id)].includes(relation.from_id))continue;
+        if(relation.scope==='owner_confirmed_same_type_identity' && decision.identity_level==='type'){
+          add(state.typeRepresentations,relation.from_id,relation.to_id);
+          for(const snapshot of decision.representations || [])if(snapshot.id===relation.from_id)for(const id of snapshot.item_ids || [])if(memberships.get(snapshot.id)?.has(id))add(state.typeItems,id,relation.to_id);
+          continue;
+        }
+        if(relation.scope!=='owner_confirmed_same_element_identity' || !physical(decision))continue;
+        if(!links.has(relation.from_id))links.set(relation.from_id,[]);links.get(relation.from_id).push(relation);
+        add(state.byRepresentation,relation.from_id,relation.to_id);const unit=ensure(relation.to_id);unit.relation_ids.add(relation.id);unit.confirmation_ids.add(decision.id);
+        if(!unit.element || !['element','component'].includes(unit.element.kind) || unit.element.identity_level==='type')unit.issues.push('invalid_instance_identity');
+      }
+      const pageIds=unique(decisions.flatMap(c=>(c.representations || []).map(r=>r.page_id)).filter(Boolean));
+      const pages=new Map(selectIds('SELECT id,source_id,page_number FROM pages WHERE id IN ',pageIds).map(p=>[p.id,p])),sources=new Map(this.getSources().map(s=>[s.id,s]));
+      for(const decision of decisions){if(!physical(decision))continue;
+        for(const snapshot of decision.representations || []){
+          const matching=(links.get(snapshot.id) || []).filter(r=>r.to_id===decision.element_id);if(!matching.length)continue;
+          const unit=ensure(decision.element_id),node=nodes.get(snapshot.id),page=pages.get(snapshot.page_id),members=memberships.get(snapshot.id) || new Map();
+          if(!node || node.page_id!==snapshot.page_id || !page)unit.issues.push('representation_page_mismatch');
+          if(decision.section)unit.sections.add(decision.section);if(decision.category)unit.categories.add(decision.category);
+          unit.confirmation_ids.add(decision.id);
+          if(!unit.representations.has(snapshot.id))unit.representations.set(snapshot.id,{id:snapshot.id,page_id:snapshot.page_id,name:node?.name_ar || node?.name || snapshot.name || snapshot.id,bbox:snapshot.bbox || node?.bbox_points || node?.bbox || null,item_ids:[],identity_relation_ids:matching.map(r=>r.id),membership_relation_ids:[],confirmation_ids:[],sources:[]});
+          const rep=unit.representations.get(snapshot.id);if(rep.page_id!==snapshot.page_id)unit.issues.push('representation_page_mismatch');
+          rep.confirmation_ids.push(decision.id);
+          const approved=Array.isArray(snapshot.item_ids)?unique(snapshot.item_ids):[];if(!approved.length)unit.issues.push('missing_approved_membership');
+          for(const itemId of approved){if(typeof itemId!=='string' || itemId.match(ITEM)?.[1]!==snapshot.page_id){unit.issues.push('invalid_approved_item');continue;}
+            rep.item_ids.push(itemId);add(state.byItem,itemId,decision.element_id);
+            const relationIds=members.get(itemId);if(!relationIds?.length)unit.issues.push('missing_membership_relation');
+            else{rep.membership_relation_ids.push(...relationIds);for(const id of relationIds)unit.relation_ids.add(id);}
+          }
+          const witnesses=(decision.sources || []).filter(w=>w.page_id===snapshot.page_id && (!w.locator || w.locator===snapshot.id));
+          for(const witness of witnesses){const source=page && sources.get(page.source_id);if((witness.source_id && witness.source_id!==page?.source_id) || (witness.source_sha256 && source?.sha256 && witness.source_sha256!==source.sha256))unit.issues.push('source_reference_mismatch');}
+          rep.sources.push(...witnesses);unit.sources.push(...witnesses);
+        }
+      }
+      // Any shared source item/representation assigned to different instances blocks the whole affected unit.
+      for(const map of [state.byItem,state.byRepresentation])for(const ids of map.values())if(ids.size>1)for(const id of ids){const record=ensure(id);record.issues.push('multiple_element_identities');for(const other of ids)if(other!==id)record.conflicts.add(other);}
+      const sourceList=values=>[...new Map(values.map(v=>[JSON.stringify(v),v])).values()];
+      for(const [elementId,record] of records){
+        if(record.sections.size>1 || record.categories.size>1)record.issues.push('classification_boundary_conflict');
+        const reps=[...record.representations.values()].sort((a,b)=>a.page_id.localeCompare(b.page_id)||a.id.localeCompare(b.id));
+        if(!reps.length || [...(state.byRepresentation.entries())].some(([id,claims])=>claims.has(elementId) && !record.representations.has(id)))record.issues.push('missing_approved_snapshot');
+        const grouped=new Map();
+        for(const rep of reps){rep.item_ids=unique(rep.item_ids).sort();rep.record_ids=unique(rep.item_ids.map(id=>id.slice(0,id.lastIndexOf(':i'))));rep.confirmation_ids=unique(rep.confirmation_ids);rep.membership_relation_ids=unique(rep.membership_relation_ids);rep.sources=sourceList(rep.sources);
+          if(!rep.item_ids.length)record.issues.push('missing_approved_membership');
+          if(!grouped.has(rep.page_id))grouped.set(rep.page_id,{page_id:rep.page_id,representation_ids:[],item_ids:[]});const p=grouped.get(rep.page_id);p.representation_ids.push(rep.id);p.item_ids.push(...rep.item_ids);
+        }
+        const unitPages=[...grouped.values()].map(p=>({...p,item_ids:unique(p.item_ids).sort()}));
+        const unit={status:record.issues.length?'ambiguous':'resolved',kind:'element',id:elementId,element_id:elementId,element_kind:record.element?.kind || null,name:record.element?.name_ar || record.element?.name || elementId,section:[...record.sections][0] || null,category:[...record.categories][0] || null,identity_level:'instance',representations:reps,representation_ids:reps.map(r=>r.id),pages:unitPages,item_ids:unique(unitPages.flatMap(p=>p.item_ids)).sort(),relation_ids:[...record.relation_ids].sort(),confirmation_ids:[...record.confirmation_ids].sort(),sources:sourceList(record.sources),reason_codes:unique(record.issues),conflicting_element_ids:[...record.conflicts],revision:state.revision,owner_confirmed:true,engineering_validated:false,physical_assembly_asserted:false};
+        unit.provenance={source_of_truth:'existing_project_relations_and_active_owner_confirmation_snapshots',identity_scope:'owner_confirmed_same_element_identity',relation_ids:unit.relation_ids,confirmation_ids:unit.confirmation_ids,sources:unit.sources,selection_only:true};state.units.set(elementId,unit);
+      }
+      this._selectionUnits=state;return state;
+    }
+    listElementSelectionUnits(pageId) {
+      return [...this._selectionUnitState().units.values()].filter(unit=>unit.status==='resolved' && (!pageId || unit.pages.some(p=>p.page_id===pageId)));
+    }
+    resolveSelectionUnit(target) {
+      const state=this._selectionUnitState(),object=target && typeof target==='object'?target:null,id=typeof target==='string'?target:object?.item_id || object?.representation_id || object?.element_id || object?.id;
+      const empty=(status,reasons,extra={})=>({status,kind:null,id:null,element_id:null,identity_level:null,representations:[],pages:[],item_ids:[],relation_ids:[],confirmation_ids:[],sources:[],reason_codes:reasons,target_id:typeof id==='string'?id:null,revision:state.revision,...extra});
+      if(typeof id!=='string' || !id)return empty('invalid',['invalid_selection_target']);
+      const itemPage=id.match(ITEM)?.[1],repPage=state.representationPages.get(id);
+      if(object?.page_id && ((itemPage && itemPage!==object.page_id) || (repPage && repPage!==object.page_id)))return empty('invalid',['target_page_mismatch']);
+      const claims=state.units.has(id)?new Set([id]):itemPage?state.byItem.get(id):state.byRepresentation.get(id),candidates=[...(claims || [])].map(elementId=>state.units.get(elementId)).filter(Boolean);
+      if(candidates.length===1 && candidates[0].status==='resolved'){
+        if(object?.page_id && !candidates[0].pages.some(p=>p.page_id===object.page_id))return empty('invalid',['target_page_mismatch']);
+        return candidates[0];
+      }
+      for(const elementId of unique(candidates.flatMap(c=>c.conflicting_element_ids || [])))if(!candidates.some(c=>c.element_id===elementId) && state.units.has(elementId))candidates.push(state.units.get(elementId));
+      if(candidates.length)return empty('ambiguous',unique([...(candidates.length>1?['multiple_element_identities']:[]),...candidates.flatMap(c=>c.reason_codes)]),{candidates:candidates.map(c=>({element_id:c.element_id,name:c.name,section:c.section,category:c.category,reason_codes:c.reason_codes})),relation_ids:unique(candidates.flatMap(c=>c.relation_ids)),confirmation_ids:unique(candidates.flatMap(c=>c.confirmation_ids)),sources:[...new Map(candidates.flatMap(c=>c.sources).map(s=>[JSON.stringify(s),s])).values()]});
+      const typeIds=[...(itemPage?state.typeItems.get(id):state.typeRepresentations.get(id)) || []];
+      return empty('unlinked',[typeIds.length || state.nonInstanceIds.has(id)?'type_or_family_identity_only':'no_active_element_identity'],{type_ids:typeIds});
     }
     _normalize(selection) {
       if (!selection || typeof selection.page_id !== 'string') fail('INVALID_SELECTION', 'اختيار بلا مرجع لوحة.');
