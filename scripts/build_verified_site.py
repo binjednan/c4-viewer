@@ -14,7 +14,7 @@ import zipfile
 
 BASE_SHA256 = '5395e01a3836ce90b976fcfca8e531a3087aee77b1988b5ab346a8b53858c631'
 DATABASE_SHA256 = 'dd69382278c0fd72c215c9c56e591aff0d76c19c737adaca23408eec6286224d'
-SCRIPTS = ('classification.js', 'store.js', 'web-resources.js', 'vector-engine.js', 'app.js')
+SCRIPTS = ('classification.js', 'store.js', 'web-resources.js', 'vector-engine.js', 'component-model.js', 'component-preview-renderer.js', 'component-preview-controller.js', 'app.js')
 
 
 class Scripts(HTMLParser):

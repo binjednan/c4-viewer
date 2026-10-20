@@ -3,10 +3,16 @@
   'use strict';
   const AUTHOR = 'C4 Drawing Linker';
   const ITEM = /^(pdf_[a-f0-9]+:p\d+):r\d+:i\d+$/;
+  const COMPONENT_APPROVAL=Symbol('explicit-owner-component-geometry-approval');
   const classification = () => {
     if (global.C4Classification) return global.C4Classification;
     if (typeof require==='function') return require('./classification.js');
     fail('CLASSIFICATION_UNAVAILABLE','تعذّر تحميل قواعد الأقسام والفئات؛ لم يُعتمد ربط جديد.');
+  };
+  const componentModel = () => {
+    if (global.C4ComponentModel) return global.C4ComponentModel;
+    if (typeof require==='function') return require('./component-model.js');
+    fail('COMPONENT_MODEL_UNAVAILABLE','تعذّر تحميل قواعد هندسة المكوّن؛ لم تُعتمد معايرة جديدة.');
   };
   const json = value => {
     if (typeof value !== 'string') return value;
@@ -54,7 +60,7 @@
   }
 
   class C4Store {
-    constructor(database) { this.db = database; this._groups = null; this._classificationCache=null; this._classificationCatalog=null; }
+    constructor(database) { this.db = database; this._groups = null; this._classificationCache=null; this._classificationCatalog=null; this._approvedComponents=null; }
     _rows(sql, parameters = []) {
       const statement = this.db.prepare(sql), result = [];
       try { statement.bind(parameters); while (statement.step()) result.push(statement.getAsObject()); }
@@ -65,8 +71,8 @@
     _run(sql, parameters = []) { this.db.run(sql, parameters); }
     _atomic(operation) {
       this.db.run('BEGIN TRANSACTION');
-      try { const result = operation(); this.db.run('COMMIT'); this._groups = null; this._classificationCache=null; return result; }
-      catch (error) { this.db.run('ROLLBACK'); this._groups = null; this._classificationCache=null; throw error; }
+      try { const result = operation(); this.db.run('COMMIT'); this._groups = null; this._classificationCache=null; this._approvedComponents=null; return result; }
+      catch (error) { this.db.run('ROLLBACK'); this._groups = null; this._classificationCache=null; this._approvedComponents=null; throw error; }
     }
     _bump() {
       this.setMeta('revision', Number(this.getMeta('revision') || 0) + 1);
@@ -447,9 +453,15 @@
         this._bump();return {removed:true,group};
       });
     }
-    commitRepresentationLink(selections, options = {}) {
+    approveComponentGeometry(selection, options={}) {
+      // A separate explicit UI action can approve one source representation. Classification or saving a group cannot call this path implicitly.
+      const result=this.commitRepresentationLink([selection],{...options,identityLevel:'instance'},COMPONENT_APPROVAL);
+      return {...result,component:this.getApprovedComponent(result.element.id)};
+    }
+    commitRepresentationLink(selections, options = {}, internalApproval=null) {
+      const componentApproval=internalApproval===COMPONENT_APPROVAL;
       const reps=[...new Map((selections || []).map(s=>{const r=this._normalize(s);return [r.id,r];})).values()];
-      const minimumRepresentations=options.existingElementId ? 1 : 2;
+      const minimumRepresentations=options.existingElementId || componentApproval ? 1 : 2;
       if (reps.length<minimumRepresentations) fail('NEED_TWO_REPRESENTATIONS',options.existingElementId ? 'حدد تمثيلًا واحدًا على الأقل لإضافته إلى العنصر الموجود.' : 'أضف مجموعتين مختلفتين على الأقل، ثم اعتمد الربط.');
       const level=options.identityLevel==='type' ? 'type' : 'instance';
       const links=reps.flatMap(r=>this._identityRelations(r.id));
@@ -471,7 +483,7 @@
         const createdNodes=[],createdRelations=[];
         if (!element) {
           elementId=(level==='type'?'C4:T:':'C4:E:')+uuid();
-          element={id:elementId,kind:level==='type'?'type':'element',identity_level:level,name_ar:options.name || reps[0].name || 'عنصر مرتبط',section:compatible.section,category:compatible.category,classification:compatible,identity_domain:classification().CATEGORIES.find(c=>c.id===compatible.category)?.domain || null,identity_scope:level==='type'?'owner_declared_common_type':'owner_declared_common_element',created_by:AUTHOR,decision_id:decisionId,created_at:now,owner_confirmed:true,engineering_validated:false,dimensions:{value:null,grade:4},physical_geometry:{value:null,grade:4}};
+          element={id:elementId,kind:level==='type'?'type':componentApproval?'component':'element',identity_level:level,name_ar:options.name || reps[0].name || 'عنصر مرتبط',section:compatible.section,category:compatible.category,classification:compatible,identity_domain:classification().CATEGORIES.find(c=>c.id===compatible.category)?.domain || null,identity_scope:level==='type'?'owner_declared_common_type':componentApproval?'owner_approved_source_component':'owner_declared_common_element',source_geometry_approved:componentApproval,created_by:AUTHOR,decision_id:decisionId,created_at:now,owner_confirmed:true,engineering_validated:false,dimensions:{value:null,grade:4},physical_geometry:{value:null,grade:4}};
           this._insertNode(element,createdNodes);
         }
         const witnesses=reps.map(r=>{
@@ -491,13 +503,94 @@
           }
           this._insertRelation(this._relation('alternative_representation',r.id,elementId,level==='type'?'owner_confirmed_same_type_identity':'owner_confirmed_same_element_identity',decisionId,witnesses),createdRelations);
         }
-        const confirmation={id:decisionId,status:'approved',approved_at:now,approved_by:'owner',action:level==='type'?'same_type_identity':'same_element_identity',identity_level:level,element_id:elementId,name:options.name || element.name_ar || null,section:compatible.section,category:compatible.category,representation_ids:reps.map(r=>r.id),representations:reps,sources:witnesses,created_node_ids:createdNodes,created_relation_ids:createdRelations,engineering_validated:false,source_of_truth:'current_project_database',created_by:AUTHOR};
+        const confirmation={id:decisionId,status:'approved',approved_at:now,approved_by:'owner',action:level==='type'?'same_type_identity':componentApproval?'component_geometry':'same_element_identity',identity_level:level,element_id:elementId,name:options.name || element.name_ar || null,section:compatible.section,category:compatible.category,representation_ids:reps.map(r=>r.id),representations:reps,sources:witnesses,source_geometry_approval:level==='instance',geometry_approval_scope:'Only the exact native source item IDs in each representation snapshot; no completeness, scale, depth or physical assembly inferred.',created_node_ids:createdNodes,created_relation_ids:createdRelations,engineering_validated:false,source_of_truth:'current_project_database',created_by:AUTHOR};
         this._run('INSERT INTO confirmations(id,data) VALUES(?,?)',[decisionId,JSON.stringify(confirmation)]);
         this._bump();return {unchanged:false,element,representations:reps,confirmation};
       });
     }
     listConfirmed(includeUndone=false) {
       return this._rows('SELECT data FROM confirmations ORDER BY rowid').map(row=>json(row.data)).filter(c=>includeUndone || c.status==='approved');
+    }
+    _representationFrameId(elementId,representationId) {return 'C4:FRAME:'+sha256(elementId+'\0'+representationId).slice(0,32);}
+    _approvedComponentState() {
+      if(this._approvedComponents)return this._approvedComponents;
+      const components=new Map(),records=new Map();
+      for(const confirmation of this.listConfirmed()){
+        if(confirmation.created_by!==AUTHOR || confirmation.approved_by!=='owner' || confirmation.identity_level==='type' || !['same_element_identity','component_geometry'].includes(confirmation.action))continue;
+        const element=this.getNode(confirmation.element_id);
+        if(!element || element.created_by!==AUTHOR || !['element','component'].includes(element.kind))continue;
+        if(!components.has(element.id))components.set(element.id,{...element,element_id:element.id,name:element.name_ar || element.name || element.id,approved:true,approval_scope:'Active explicit owner confirmation of exact source graphics; dimensions, world placement, geometry completeness and engineering validity are separate.',representations:[],approved_decision_ids:[],engineering_validated:false});
+        const component=components.get(element.id);component.approved_decision_ids.push(confirmation.id);
+        for(const snapshot of confirmation.representations || []){
+          if(!snapshot.id || !snapshot.page_id || !Array.isArray(snapshot.item_ids) || !snapshot.item_ids.length)continue;
+          const items=unique(snapshot.item_ids).sort();
+          if(items.some(id=>typeof id!=='string' || id.match(ITEM)?.[1]!==snapshot.page_id))continue;
+          if(!this._identityRelations(snapshot.id).some(link=>link.to_id===element.id))continue;
+          const witnesses=(confirmation.sources || []).filter(w=>w.page_id===snapshot.page_id),witness=witnesses.find(w=>w.locator===snapshot.id) || witnesses[0];
+          if(!witness?.source_id || !witness.source_sha256)continue;
+          const key=element.id+'\0'+snapshot.id,{page,source}=this._classificationContext(snapshot.page_id);
+          if(!records.has(key))records.set(key,{id:snapshot.id,page_id:snapshot.page_id,name:this.getNode(snapshot.id)?.name_ar || snapshot.name || snapshot.id,bbox:snapshot.bbox || this.getNode(snapshot.id)?.bbox_points || this.getNode(snapshot.id)?.bbox || null,item_ids:[],record_ids:[],approved:true,approved_decision_ids:[],sources:[],source_id:witness.source_id,source_sha256:witness.source_sha256,drawings_sha256:this._classificationCatalog.resources?.pages?.[page.id]?.drawings?.sha256 || null,orientation:componentModel().suggestOrientation(page),source_title:page.title_candidate || '',issues:[]});
+          const rep=records.get(key);
+          if(rep.source_id!==witness.source_id || rep.source_sha256!==witness.source_sha256 || source?.id!==witness.source_id || source?.sha256!==witness.source_sha256){rep.approved=false;rep.issues.push({code:'approval_source_conflict',decision_id:confirmation.id});}
+          rep.item_ids=unique([...rep.item_ids,...items]).sort();rep.approved_decision_ids.push(confirmation.id);rep.sources.push(witness);
+        }
+      }
+      for(const [key,rep] of records){const elementId=key.slice(0,key.indexOf('\0'));
+        rep.record_ids=unique(rep.item_ids.map(id=>id.slice(0,id.lastIndexOf(':i'))));
+        rep.approved_decision_ids=unique(rep.approved_decision_ids);
+        rep.approval_signature=sha256(JSON.stringify({element_id:elementId,representation_id:rep.id,page_id:rep.page_id,source_id:rep.source_id,source_sha256:rep.source_sha256,item_ids:rep.item_ids}));
+        rep.placement=this._frameForApprovedRepresentation(elementId,rep);components.get(elementId).representations.push(rep);
+      }
+      for(const [id,component] of components){component.approved_decision_ids=unique(component.approved_decision_ids);if(!component.representations.length)components.delete(id);}
+      this._approvedComponents=components;return components;
+    }
+    listApprovedComponents() {return [...this._approvedComponentState().values()];}
+    getApprovedComponent(elementId) {return this._approvedComponentState().get(elementId) || null;}
+    _frameForApprovedRepresentation(elementId,rep) {
+      const node=this.getNode(this._representationFrameId(elementId,rep.id));
+      if(!node)return {status:'incomplete',mapping:null,validation:componentModel().validateFrame(null),approval_context:null};
+      const validation=componentModel().validateFrame(node.mapping),context=node.approval_context || {},issues=[];
+      if(context.element_id!==elementId || context.representation_id!==rep.id || context.page_id!==rep.page_id || context.source_id!==rep.source_id || context.source_sha256!==rep.source_sha256 || (rep.drawings_sha256 && context.drawings_sha256!==rep.drawings_sha256) || context.approval_signature!==rep.approval_signature || JSON.stringify(unique(context.item_ids).sort())!==JSON.stringify(rep.item_ids))issues.push('approved_source_membership_changed');
+      if(!(context.decision_ids || []).some(id=>rep.approved_decision_ids.includes(id)))issues.push('geometry_approval_inactive');
+      if(rep.approved!==true)issues.push('source_approval_conflict');
+      const status=node.status==='revoked'?'revoked':node.status!=='approved'?'draft':issues.length?'stale':!validation.valid?'incomplete':'approved';
+      return {...node,status,stored_status:node.status,validation,issues};
+    }
+    getRepresentationFrame(elementId,representationId) {
+      const rep=this.getApprovedComponent(elementId)?.representations.find(r=>r.id===representationId);
+      if(rep)return rep.placement;
+      const node=this.getNode(this._representationFrameId(elementId,representationId));
+      return node?{...node,stored_status:node.status,status:node.status==='revoked'?'revoked':'stale',issues:['geometry_approval_inactive'],validation:componentModel().validateFrame(node.mapping)}:null;
+    }
+    saveRepresentationFrame(elementId,representationId,mapping,options={}) {
+      const rep=this.getApprovedComponent(elementId)?.representations.find(r=>r.id===representationId);
+      if(!rep?.approved)fail('GEOMETRY_NOT_APPROVED','اعتمد خطوط المكوّن أولًا؛ التحديد المؤقت والتصنيف التلقائي لا يعتمدان هندسته.');
+      if(!mapping || typeof mapping!=='object' || Array.isArray(mapping))fail('INVALID_FRAME','بيانات معايرة اللوحة غير صحيحة.');
+      // Reject NaN/Infinity before JSON serialization could silently turn them into unknown values.
+      const invalidNumber=value=>typeof value==='number'?!Number.isFinite(value):Array.isArray(value)?value.some(invalidNumber):value && typeof value==='object'?Object.values(value).some(invalidNumber):false;
+      if(invalidNumber(mapping))fail('INVALID_FRAME','كل القيم الرقمية المدخلة يجب أن تكون محدودة وصحيحة.');
+      const savedMapping=JSON.parse(JSON.stringify(mapping)),validation=componentModel().validateFrame(savedMapping),approve=options.approve===true;
+      if(approve && (!validation.valid || (validation.extrusion.requested && !validation.extrusion.valid)))fail('INCOMPLETE_FRAME','أكمل المستوى والأصل والمحاور والمقياس ومرجع العمق إن أدخلته قبل اعتماد المعايرة.',validation);
+      const reference=typeof options.reference==='string'?options.reference.trim():'';
+      if(approve && !reference)fail('MISSING_FRAME_REFERENCE','اكتب مرجع المعايرة أو قرارك الصريح بالأصل والمقياس والمستوى قبل اعتمادها.');
+      const id=this._representationFrameId(elementId,representationId),old=this.getNode(id),now=new Date().toISOString();
+      const approvalContext={element_id:elementId,representation_id:representationId,page_id:rep.page_id,source_id:rep.source_id,source_sha256:rep.source_sha256,drawings_sha256:rep.drawings_sha256 || null,item_ids:rep.item_ids.slice(),approval_signature:rep.approval_signature,decision_ids:rep.approved_decision_ids.slice()};
+      const sources=rep.sources.map(source=>({...source,locator:representationId,reference}));
+      const history=[...(old?.history || [])];
+      if(old)history.push({status:old.status,mapping:old.mapping,approval_context:old.approval_context,reference:old.reference,updated_at:old.updated_at,approved_at:old.approved_at || null,revoked_at:old.revoked_at || null,decision_revision:old.decision_revision});
+      const node={id,kind:'component_representation_frame',schema:'c4.approved-source-frame.v1',target:{element_id:elementId,representation_id:representationId,page_id:rep.page_id},mapping:savedMapping,status:approve?'approved':'draft',approval_context:approvalContext,sources,reference,history,created_at:old?.created_at || now,updated_at:now,approved_at:approve?now:null,approved_by:approve?'owner':null,decision_revision:Number(this.getMeta('revision') || 0)+1,created_by:AUTHOR,engineering_validated:false,physical_assembly_asserted:false,coordinate_policy:'Native source coordinates are converted by an explicit approved frame. Unknown scale, level, origin or orientation remains unresolved; PDF rotation is not world Z.',depth_policy:'Depth is optional and requires its own explicit positive value, source/reference, sign and approval. Planar fill alone is not a solid.'};
+      this._atomic(()=>{this._run('INSERT OR REPLACE INTO nodes(id,data) VALUES(?,?)',[id,JSON.stringify(node)]);this._bump();});
+      return this.getRepresentationFrame(elementId,representationId);
+    }
+    revokeRepresentationFrame(elementId,representationId) {
+      const id=this._representationFrameId(elementId,representationId),node=this.getNode(id);
+      if(!node || node.kind!=='component_representation_frame' || node.created_by!==AUTHOR)fail('UNKNOWN_FRAME','لا توجد معايرة محفوظة لهذا التمثيل.');
+      if(node.status==='revoked')return this.getRepresentationFrame(elementId,representationId);
+      return this._atomic(()=>{
+        const now=new Date().toISOString();node.history=[...(node.history || []),{status:node.status,mapping:node.mapping,approval_context:node.approval_context,reference:node.reference,updated_at:node.updated_at,approved_at:node.approved_at || null,decision_revision:node.decision_revision}];
+        node.status='revoked';node.revoked_at=now;node.revoked_by='owner';node.updated_at=now;node.decision_revision=Number(this.getMeta('revision') || 0)+1;
+        this._run('UPDATE nodes SET data=? WHERE id=?',[JSON.stringify(node),id]);this._bump();return {...node,validation:componentModel().validateFrame(node.mapping)};
+      });
     }
     undoConfirmation(id) {
       const active=this.listConfirmed(),latest=active[active.length-1];
@@ -563,12 +656,12 @@
           if (relation.type==='hierarchy_member' && relation.to_id===group.id && relation.created_by===AUTHOR) relationIds.add(relation.id);
         }
       }
-      const classificationNodes=this._rows('SELECT data FROM nodes').map(r=>json(r.data)).filter(n=>n.created_by===AUTHOR && ['drawing_classification','classification_section','classification_category','drawing_group_override','drawing_classification_policy'].includes(n.kind));
+      const classificationNodes=this._rows('SELECT data FROM nodes').map(r=>json(r.data)).filter(n=>n.created_by===AUTHOR && ['drawing_classification','classification_section','classification_category','drawing_group_override','drawing_classification_policy','component_representation_frame'].includes(n.kind));
       for(const n of classificationNodes)nodeIds.add(n.id);
       for(const row of this._rows('SELECT data FROM relations')){const r=json(row.data);if(r.created_by===AUTHOR && r.classification_binding)relationIds.add(r.id);}
       const relations=[...relationIds].map(id=>this.getRelation(id)).filter(Boolean);
       for (const r of relations) { nodeIds.add(r.from_id);nodeIds.add(r.to_id); }
-      return {schema:'c4.owner-confirmed-relations-receipt.v1',project:this.getMeta('project'),database_revision:Number(this.getMeta('revision')||0),exported_at:new Date().toISOString(),source_index:this.getMeta('source_index'),sources:this.getSources(),authoritative_database:this.getMeta('authoritative_database'),editing_policy:'Decision receipt exported from the one project database; not a second editable graph.',engineering_validated:false,owner_confirmation_scope:'Identity and selected source-graphics membership only; no dimensions, geometry completeness or physical assembly validation.',classification_policy:{version:classification().VERSION,automatic_enabled:this._classificationState().enabled,source_layer_bindings:'Exact original layer and record-range selectors; category membership only, never a physical component.',override_precedence:'Explicit owner item/representation decisions supersede automatic layer membership. A later cancellation makes a member unknown; a later owner assignment supersedes an earlier cancellation using decision_revision. Conflicting overlapping owner assignments remain conflicts. Original known groups respect member cancellations. Suppressed original groups remain unchanged and are omitted from automatic group selection.',unknown_identity_matching:'Blocked until explicitly classified; an unknown category is never a wildcard.'},active_confirmations:active,drawing_group_ids:drawingGroups.map(g=>g.id),classification_binding_ids:classificationNodes.filter(n=>n.kind==='drawing_classification').map(n=>n.id),group_overrides:classificationNodes.filter(n=>n.kind==='drawing_group_override'),undone_confirmation_ids:this.listConfirmed(true).filter(c=>c.status==='undone').map(c=>c.id),nodes:[...nodeIds].map(id=>this.getNode(id)).filter(Boolean),relations};
+      return {schema:'c4.owner-confirmed-relations-receipt.v1',project:this.getMeta('project'),database_revision:Number(this.getMeta('revision')||0),exported_at:new Date().toISOString(),source_index:this.getMeta('source_index'),sources:this.getSources(),authoritative_database:this.getMeta('authoritative_database'),editing_policy:'Decision receipt exported from the one project database; not a second editable graph.',engineering_validated:false,owner_confirmation_scope:'Identity and exact selected source-graphics membership; optional explicitly approved placement/depth, without engineering validation or geometry-completeness assertion.',component_preview_policy:{version:componentModel().VERSION,geometry:'Only exact native item IDs captured by active owner confirmations. Saved groups, classifications and temporary selections are not geometry approvals.',placement:'Explicit approved source-plane mapping and metres-per-source-unit scale required for assembled 3D. Unresolved source views remain 2D.',fill:'Native closed source contours only; planar fill is not a solid. Extrusion requires separately approved depth, direction and reference; holes are preserved or unsupported profiles are refused.',revocation:'Placement history is retained in the same graph. Inactive identity approval or changed source membership makes its frame stale.'},component_frame_ids:classificationNodes.filter(n=>n.kind==='component_representation_frame').map(n=>n.id),classification_policy:{version:classification().VERSION,automatic_enabled:this._classificationState().enabled,source_layer_bindings:'Exact original layer and record-range selectors; category membership only, never a physical component.',override_precedence:'Explicit owner item/representation decisions supersede automatic layer membership. A later cancellation makes a member unknown; a later owner assignment supersedes an earlier cancellation using decision_revision. Conflicting overlapping owner assignments remain conflicts. Original known groups respect member cancellations. Suppressed original groups remain unchanged and are omitted from automatic group selection.',unknown_identity_matching:'Blocked until explicitly classified; an unknown category is never a wildcard.'},active_confirmations:active,drawing_group_ids:drawingGroups.map(g=>g.id),classification_binding_ids:classificationNodes.filter(n=>n.kind==='drawing_classification').map(n=>n.id),group_overrides:classificationNodes.filter(n=>n.kind==='drawing_group_override'),undone_confirmation_ids:this.listConfirmed(true).filter(c=>c.status==='undone').map(c=>c.id),nodes:[...nodeIds].map(id=>this.getNode(id)).filter(Boolean),relations};
     }
   }
   C4Store.sha256=sha256;
