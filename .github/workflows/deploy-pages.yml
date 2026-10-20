@@ -1,0 +1,51 @@
+name: Publish C4 viewer
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: c4-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download the verified C4 site release
+        env:
+          C4_ASSET_URL: https://github.com/binjednan/c4-viewer/releases/download/c4-mobile-2026-10-20/C4-Mobile-Site-2026-10-20.zip
+          C4_ASSET_SHA256: 5395e01a3836ce90b976fcfca8e531a3087aee77b1988b5ab346a8b53858c631
+        run: |
+          curl --fail --location --retry 3 "$C4_ASSET_URL" --output c4-site.zip
+          python3 - <<'PY'
+          import hashlib, os, pathlib, zipfile
+          archive = pathlib.Path('c4-site.zip')
+          with archive.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          if digest != os.environ['C4_ASSET_SHA256']:
+              raise SystemExit('The uploaded site does not match the verified release.')
+          with zipfile.ZipFile(archive) as bundle:
+              names = bundle.namelist()
+              if len(names) != 23 or not {'index.html', 'project.c4db.gz', '.nojekyll'} <= set(names):
+                  raise SystemExit('Unexpected site package.')
+              if any(pathlib.PurePosixPath(name).name != name for name in names):
+                  raise SystemExit('The package must contain only root-level files.')
+              bundle.extractall('_site')
+          PY
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload the static site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Publish the viewer
+        id: deployment
+        uses: actions/deploy-pages@v4
