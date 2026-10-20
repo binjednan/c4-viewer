@@ -89,7 +89,7 @@ function hitsAt(p){
 function hitTest(p){return hitsAt(p)[0]||null;}
 function transformedBox(b){return bounds([[b[0],b[1]],[b[2],b[1]],[b[2],b[3]],[b[0],b[3]]].map(p=>apply(S.matrix,p)));}
 
-function isMobile(){return matchMedia('(max-width:999px)').matches;}
+function isMobile(){return matchMedia('(max-width:930px)').matches;}
 function resolvedTheme(){return document.documentElement.dataset.theme==='dark'||(document.documentElement.dataset.theme==='system'&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light';}
 function redraw(){
   if(!S.page||!S.base||!S.vector)return;
@@ -377,7 +377,7 @@ async function loadHostedProject(){
   }catch(e){busy(false);$('welcome').classList.remove('hidden');$('engineError').classList.remove('hidden');$('engineError').textContent=e.message;$('welcomeOpen').textContent='إعادة فتح المشروع';}
   finally{loadHostedProject.active=false;$('welcomeOpen').disabled=false;}
 }
-async function chooseDatabase(){if(!S.ready)return;if(S.dirty&&S.store){notify('احفظ المشروع قبل فتح قاعدة أخرى للاحتفاظ بنسخة الملف.');}if(window.showOpenFilePicker){try{const [handle]=await window.showOpenFilePicker({multiple:false,types:[{description:'قاعدة مشروع C4',accept:{'application/octet-stream':['.c4db','.sqlite','.db']}}]});const file=await handle.getFile();await openDatabase(file,handle);return;}catch(e){if(e.name==='AbortError')return;}}$('dbInput').click();}
+function chooseDatabase(){if(!S.ready)return;$('dbInput').click();}
 
 async function init(){
   try{
