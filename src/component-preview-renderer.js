@@ -128,17 +128,17 @@
       return{wires:this.model?.wires||[],faces:this.model?.faces||[]};
     }
     _rebuild(){
-      const geometry=this._rawGeometry(),rawWires=geometry.wires.filter(validWire),bounds3=this.model?.bounds;
+      const geometry=this._rawGeometry(),hasDimensions=w=>validWire(w)&&(this.view==='source'||w.points.every(p=>p.length===3)),rawWires=geometry.wires.filter(hasDimensions),bounds3=this.model?.bounds;
       this.basis=basisFor(this.view,this.yaw,this.pitch,this.orbit);
       if(this.view==='source')this.pivot=[0,0,0];
-      else if(bounds3&&finitePoint(bounds3.min)&&finitePoint(bounds3.max))this.pivot=[0,1,2].map(k=>((bounds3.min[k]||0)+(bounds3.max[k]||0))/2);
+      else if(bounds3&&finitePoint(bounds3.min)&&finitePoint(bounds3.max)&&bounds3.min.length===3&&bounds3.max.length===3)this.pivot=[0,1,2].map(k=>(bounds3.min[k]+bounds3.max[k])/2);
       else{
         const b=[Infinity,Infinity,Infinity,-Infinity,-Infinity,-Infinity];
         for(const w of rawWires)for(const p of w.points)for(let k=0;k<3;k++){b[k]=Math.min(b[k],p[k]||0);b[k+3]=Math.max(b[k+3],p[k]||0);}
         this.pivot=Number.isFinite(b[0])?[0,1,2].map(k=>(b[k]+b[k+3])/2):[0,0,0];
       }
       const cache=new Map(),project=w=>{
-        if(cache.has(w))return cache.get(w);if(!validWire(w))return null;
+        if(cache.has(w))return cache.get(w);if(!hasDimensions(w))return null;
         const points=w.points.map(p=>projectPoint(p,this.basis,this.pivot)),out={wire:w,kind:w.kind,points,bounds:primitiveBounds(w.kind,points),depth:points.reduce((n,p)=>n+p[2],0)/points.length};
         cache.set(w,out);return out;
       };
